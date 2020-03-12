@@ -4,15 +4,27 @@ import json
 import uuid
 import argparse
 from datetime import datetime, date
+from queue import Queue
+import threading
+import os
 
 import boto3
+from botocore.config import Config
 
-# This uses your default AWS profile settings
-athena_client = boto3.client('athena')
-s3_client = boto3.client('s3')
+config = Config(
+    retries=dict(
+        max_attempts=10
+    )
+)
+
+athena_client = boto3.client('athena', config=config)
+s3_client = boto3.client('s3', config=config)
 
 # 50 is the max query execution details we can fetch in a batch
 MAX_ATHENA_BATCH_SIZE = 50
+
+q = Queue()
+num_processed = 0
 
 
 def parse_args():
@@ -23,27 +35,54 @@ def parse_args():
     return parser.parse_args()
 
 
+def process_batch(execution_ids, bucket, prefix):
+    stats = get_query_executions(execution_ids)
+    upload_to_s3(stats, bucket, prefix)
+
+
+def do_work(bucket, prefix):
+    global q, num_processed
+    while True:
+        execution_ids = q.get()
+        if execution_ids:
+            process_batch(execution_ids, bucket, prefix)
+            q.task_done()
+            num_processed += len(execution_ids)
+            print(f'Processed batch with {len(execution_ids)} ({num_processed} total)')
+
+
 def loop_and_fetch_stats(bucket, prefix):
+    global q
+
+    max_threads = 25
+    threads = []
+    for x in range(max_threads):
+        threads.append(threading.Thread(target=do_work, args=(bucket, prefix), daemon=True))
+    for thread in threads:
+        thread.start()
+
     execution_ids = []
     counter = 1
     for qid in get_execution_ids():
         execution_ids.append(qid)
         # If we've collected fifty, go ahead and fetch those stats and upload them back to S3
         if MAX_ATHENA_BATCH_SIZE == len(execution_ids):
-            print("Fetching data on batch %d (%d total queries)" % (counter, counter * MAX_ATHENA_BATCH_SIZE))
-            stats = get_query_executions(execution_ids)
-            upload_to_s3(stats, bucket, prefix)
+            print("Adding batch %d (%d total queries) to queue" % (counter, counter * MAX_ATHENA_BATCH_SIZE))
+            q.put(execution_ids)
             execution_ids = []
             counter += 1
 
     # All done fetching execution ids, if we have any left, upload the stats
     if execution_ids:
-        print("Fetching final data on batch %d (%d total queries)" % (
-            counter+1,
+        print("Adding final batch %d (%d total queries)" % (
+            counter + 1,
             (counter * MAX_ATHENA_BATCH_SIZE) + len(execution_ids)
         ))
+        q.put(execution_ids)
         stats = get_query_executions(execution_ids)
         upload_to_s3(stats, bucket, prefix)
+
+    q.join()
 
 
 def upload_to_s3(query_stats, bucket, prefix):
@@ -60,9 +99,10 @@ def upload_to_s3(query_stats, bucket, prefix):
     gzip_out.close()
 
     # s3_client.upload_fileobj(writer, TARGET_BUCKET, TARGET_PREFIX + "damon.json.gz")
+    key = os.path.join(prefix, str(uuid.uuid4()) + '.json.gz')
     s3_client.put_object(
         Bucket=bucket,
-        Key="prefix%s.json.gz" % uuid.uuid4(),
+        Key=key,
         ContentType='text/plain',  # the original type
         ContentEncoding='gzip',  # MUST have or browsers will error
         Body=writer.getvalue()
